@@ -1,0 +1,548 @@
+import os
+import re
+import sqlite3
+import random
+import time
+import asyncio
+import logging
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+
+# =========================
+# تنظیمات
+# =========================
+
+TOKEN = os.getenv("BOT_TOKEN")
+DB_FILE = "bot.db"
+
+WAIT_SECONDS = 300  # 5 دقیقه
+
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+
+# =========================
+# ابزارهای عمومی
+# =========================
+
+DIGIT_MAP = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789"
+)
+
+
+def normalize(text):
+    if not text:
+        return ""
+
+    text = text.translate(DIGIT_MAP)
+    text = text.replace("٬", "")
+    text = text.replace(",", "")
+    return text.strip()
+
+
+def display_name(user):
+    if user.username:
+        return f"{user.full_name} (@{user.username})"
+    return user.full_name
+
+
+def is_group(update):
+    return (
+        update.effective_chat
+        and update.effective_chat.type in ("group", "supergroup")
+    )
+
+
+# =========================
+# دیتابیس
+# =========================
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS group_users (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            coins INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            game_type TEXT NOT NULL,
+            creator_id INTEGER NOT NULL,
+            creator_name TEXT NOT NULL,
+            player2_id INTEGER,
+            player2_name TEXT,
+            stake INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'waiting',
+            message_id INTEGER,
+            board TEXT DEFAULT '.........',
+            turn_user_id INTEGER,
+            creator_side TEXT,
+            player2_side TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def ensure_user(chat_id, user):
+    conn = get_db()
+
+    conn.execute("""
+        INSERT INTO group_users (chat_id, user_id, name, coins, wins)
+        VALUES (?, ?, ?, 0, 0)
+        ON CONFLICT(chat_id, user_id)
+        DO UPDATE SET name = excluded.name
+    """, (
+        chat_id,
+        user.id,
+        user.full_name
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_balance(chat_id, user_id):
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT coins
+        FROM group_users
+        WHERE chat_id = ? AND user_id = ?
+    """, (chat_id, user_id)).fetchone()
+
+    conn.close()
+
+    if not row:
+        return 0
+
+    return row["coins"]
+
+
+def add_coins(chat_id, user_id, amount):
+    conn = get_db()
+
+    conn.execute("""
+        UPDATE group_users
+        SET coins = coins + ?
+        WHERE chat_id = ? AND user_id = ?
+    """, (amount, chat_id, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def remove_coins(chat_id, user_id, amount):
+    conn = get_db()
+
+    conn.execute("""
+        UPDATE group_users
+        SET coins = CASE
+            WHEN coins >= ? THEN coins - ?
+            ELSE 0
+        END
+        WHERE chat_id = ? AND user_id = ?
+    """, (amount, amount, chat_id, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def try_take_coins(chat_id, user_id, amount):
+    conn = get_db()
+
+    cursor = conn.execute("""
+        UPDATE group_users
+        SET coins = coins - ?
+        WHERE chat_id = ?
+          AND user_id = ?
+          AND coins >= ?
+    """, (
+        amount,
+        chat_id,
+        user_id,
+        amount
+    ))
+
+    success = cursor.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return successdef 
+    add_win(chat_id, user_id):
+    conn = get_db()
+
+    conn.execute("""
+        UPDATE group_users
+        SET wins = wins + 1
+        WHERE chat_id = ? AND user_id = ?
+    """, (chat_id, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def get_leaderboard(chat_id, field):
+    if field not in ("coins", "wins"):
+        return []
+
+    conn = get_db()
+
+    rows = conn.execute(f"""
+        SELECT name, coins, wins
+        FROM group_users
+        WHERE chat_id = ?
+        ORDER BY {field} DESC
+        LIMIT 10
+    """, (chat_id,)).fetchall()
+
+    conn.close()
+
+    return rows
+
+
+def get_game(game_id):
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT *
+        FROM games
+        WHERE id = ?
+    """, (game_id,)).fetchone()
+
+    conn.close()
+
+    return row
+
+
+def has_active_game(chat_id, user_id):
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT id
+        FROM games
+        WHERE chat_id = ?
+          AND (creator_id = ? OR player2_id = ?)
+          AND status IN ('waiting', 'playing')
+        LIMIT 1
+    """, (
+        chat_id,
+        user_id,
+        user_id
+    )).fetchone()
+
+    conn.close()
+
+    return row is not None
+
+
+# =========================
+# تشخیص صاحب گروه
+# =========================
+
+async def is_owner(update, context):
+    try:
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+
+        member = await context.bot.get_chat_member(
+            chat_id,
+            user_id
+        )
+
+        return member.status == "creator"
+
+    except Exception:
+        return False
+
+
+# =========================
+# کیبورد بازی‌ها
+# =========================
+
+def chance_keyboard(game_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🎲 ورود به بازی",
+                callback_data=f"join_chance:{game_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ لغو",
+                callback_data=f"cancel_game:{game_id}"
+            )
+        ]
+    ])
+
+
+def coin_keyboard(game_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🦁 شیر",
+                callback_data=f"join_coin:{game_id}:شیر"
+            ),
+            InlineKeyboardButton(
+                "🪙 خط",
+                callback_data=f"join_coin:{game_id}:خط"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ لغو",
+                callback_data=f"cancel_game:{game_id}"
+            )
+        ]
+    ])
+
+
+def xo_join_keyboard(game_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "❌ ورود به بازی",
+                callback_data=f"join_xo:{game_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ لغو",
+                callback_data=f"cancel_game:{game_id}"
+            )
+        ]
+    ])
+
+
+def xo_board(game_id, board):
+    symbols = {
+        "X": "❌",
+        "O": "⭕",
+        ".": "⬜"
+    }
+
+    keyboard = []
+
+    for row in range(3):
+        buttons = []
+
+        for col in range(3):
+            index = row * 3 + col
+
+            buttons.append(
+                InlineKeyboardButton(
+                    symbols[board[index]],
+                    callback_data=f"xo_move:{game_id}:{index}"
+                )
+            )
+
+        keyboard.append(buttons)
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# =========================
+# ایجاد بازی
+# =========================
+
+async def create_game(update, game_type, stake):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    ensure_user(chat_id, user)
+
+    if stake <= 0:
+        await update.message.reply_text(
+            "❌ مبلغ بازی باید بیشتر از صفر سکه باشد."
+        )
+        return
+
+    if has_active_game(chat_id, user.id):
+        await update.message.reply_text(
+            "❌ شما همین الان یک بازی فعال دارید.\n"
+            "اول آن بازی را تمام کنید."
+        )
+        return
+
+    if not try_take_coins(chat_id, user.id, stake):
+        balance = get_balance(chat_id, user.id)await update.message.reply_text(
+            f"❌ سکه کافی نداری.\n"
+            f"موجودی شما: {balance:,} سکه"
+        )
+        return
+
+    conn = get_db()
+
+    cursor = conn.execute("""
+        INSERT INTO games (
+            chat_id,
+            game_type,
+            creator_id,
+            creator_name,
+            stake,
+            status,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'waiting', ?)
+    """, (
+        chat_id,
+        game_type,
+        user.id,
+        user.full_name,
+        stake,
+        int(time.time())
+    ))
+
+    game_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    if game_type == "chance":
+
+        text = (
+            "🎲 بازی شانسی\n\n"
+            f"👤 سازنده: {user.full_name}\n"
+            f"💰 مبلغ بازی: {stake:,} سکه\n"
+            f"🏆 جایزه: {stake * 2:,} سکه\n\n"
+            "برای ورود، نفر دوم روی دکمه زیر بزند.\n"
+            "⏳ مهلت ورود: ۵ دقیقه"
+        )
+
+        keyboard = chance_keyboard(game_id)
+
+    elif game_type == "coin":
+
+        text = (
+            "🦁 شیر یا خط\n\n"
+            f"👤 سازنده: {user.full_name}\n"
+            f"💰 مبلغ بازی: {stake:,} سکه\n"
+            f"🏆 جایزه: {stake * 2:,} سکه\n\n"
+            "نفر دوم وارد شود و شیر یا خط را انتخاب کند.\n"
+            "⏳ مهلت ورود: ۵ دقیقه"
+        )
+
+        keyboard = coin_keyboard(game_id)
+
+    else:
+
+        text = (
+            "❌⭕ بازی ایکس او\n\n"
+            f"👤 سازنده: {user.full_name}\n"
+            f"💰 مبلغ بازی: {stake:,} سکه\n"
+            f"🏆 جایزه: {stake * 2:,} سکه\n\n"
+            "نفر دوم برای ورود روی دکمه بزند.\n"
+            "⏳ مهلت ورود: ۵ دقیقه"
+        )
+
+        keyboard = xo_join_keyboard(game_id)
+
+    sent = await update.message.reply_text(
+        text,
+        reply_markup=keyboard
+    )
+
+    conn = get_db()
+
+    conn.execute("""
+        UPDATE games
+        SET message_id = ?
+        WHERE id = ?
+    """, (
+        sent.message_id,
+        game_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+# =========================
+# مدیریت پیام‌ها
+# =========================
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not update.message or not update.effective_user:
+        return
+
+    if not is_group(update):
+        return
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    text = normalize(update.message.text)
+
+    ensure_user(chat_id, user)
+
+    # =========================
+    # موجودی
+    # =========================
+
+    if text in ("موجودی", "موجودی من", "سکه"):
+
+        balance = get_balance(chat_id, user.id)
+
+        await update.message.reply_text(
+            f"💰 موجودی {user.full_name}:\n\n"
+            f"🪙 {balance:,} سکه"
+        )
+
+        return
+
+    # =========================
+    # لیدربورد سکه
+    # =========================
+
+    if text in ("لیدربورد", "لیدر بورد", "ثروتمندترین"):
+
+        rows = get_leaderboard(chat_id, "coins")
+
+        if not rows:
+            await update.message.reply_text(
+                "هنوز کسی در جدول نیست."
+            )
+            return
+
+        message = "🏆 لیدربورد سکه\n\n"
+
+        medals = ["🥇", "🥈", "🥉"]
+
+        for i, row in enumerate(rows, start=1):
+
+            medal = medals[i - 1] if i <= 3 else f"{i}."
+
+            message += (
+                f"{medal
